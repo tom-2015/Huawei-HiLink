@@ -13,6 +13,12 @@
  * functionality tested with Huawei E303
  * Link: http://www.huaweidevices.de/e303
  **/
+/*
+This class was last tested and modifie to with with E303 USB modem with:
+hardware: CH1E3531SM
+software: 22.318.25.00.414
+web ui: 15.100.10.00.414
+*/
 namespace AMWD;
 
 @error_reporting(0);
@@ -22,16 +28,54 @@ namespace AMWD;
 function_exists('curl_version') or die('cURL Extension needed'.PHP_EOL);
 function_exists('simplexml_load_string') or die('simplexml needed'.PHP_EOL);
 
+/* ---                     CONSTANTS                           ---
+------------------------------------------------------------------ */
+define("ERROR_SYSTEM_NO_SUPPORT", 100002);
+define("ERROR_SYSTEM_NO_RIGHTS",100003);
+define("ERROR_SYSTEM_BUSY",100004);
+define("ERROR_FORMAT_ERROR",100005);
+define("ERROR_LOGIN_USERNAME_WRONG",108001);
+define("ERROR_LOGIN_PASSWORD_WRONG",108002);
+define("ERROR_LOGIN_ALREADY_LOGIN",108003);
+define("ERROR_LOGIN_USERNAME_PWD_WRONG",108006);
+define("ERROR_LOGIN_USERNAME_PWD_ORERRUN",108007);
+define("ERROR_VOICE_BUSY",120001);
+define("ERROR_WRONG_TOKEN",125001);
+define("SMS_SYSTEMBUSY", 113018);
+
+define ("SMS_BOX_IN", 1);
+define ("SMS_BOX_OUT", 2);
+define ("SMS_BOX_DRAFT", 3);
+define ("SMS_BOX_DELETED", 4);
+define ("SMS_BOX_UNREAD", "unread");
+
+define ("CONNECTION_STATUS_CONNECTING", 900);
+define ("CONNECTION_STATUS_CONNECTED", 901);
+define ("CONNECTION_STATUS_DISCONNECTED", 902);
+define ("CONNECTION_STATUS_DISCONNECTING", 903);
 
 class HiLink {
 	// Class Attributes
-	private $host, $ipcheck;
+	private $host, $ipcheck, $useToken;
 
-	public $trafficStats, $monitor, $device;
+	public $trafficStats, $monitor, $device, $lastError, $status_xml;
 
-	public function __construct() {
-		$this->setHost('192.168.1.1');
-		$this->setIpCheck('http://dev.am-wd.de/ip.php');
+	/**
+	 * HiLink::__construct()
+	 * 
+	 * @param string $host the host IP of the huawei stick
+	 * @param mixed $external_ip_check http url(s) which return the public IP address, can be array for backup in case a link doesn't work anymore
+	 * @param integer $timeout optional a timeout for communicating with the stick
+	 * @return void
+	 */
+	public function __construct($host='192.168.8.1', $external_ip_check= null, $timeout=10) {
+	    if ($external_ip_check==null){
+	       $external_ip_check=array("http://icanhazip.com/","http://checkip.amazonaws.com/","https://wtfismyip.com/text", "http://ipecho.net/plain","http://v4.ident.me/", "http://smart-ip.net/myip");
+        }
+	    $this->setHost($host);
+		$this->setIpCheck($external_ip_check);
+        $this->useToken=true;
+        $this->timeout=$timeout;
 	}
 
 	// call default constructor
@@ -56,15 +100,24 @@ class HiLink {
 			$this->host = $host;
 		}
 	}
+
 	public function getHost() {
 		return $this->host;
 	}
 
 	// check if server (HiLink host) is reachable
-	public function online($server = '', $timeout = 1) {
+	/**
+	 * HiLink::online()
+	 * Checks if the $server is reachable 
+	 * @param string $server optional or will use the one from setHost
+	 * @param integer $timeout
+     * @param string $status , returns the status xml 
+	 * @return bool
+	 */
+	public function online($server = '', $timeout = 2) {
 		if (empty($server))
 				$server = $this->host;
-
+        
 		$sys = $this->getSystem();
 		switch ($sys) {
 			case "win":
@@ -79,15 +132,16 @@ class HiLink {
 			default:
 				return false;
 		}
+
 		$res = exec($cmd, $out, $ret);
 
 		if ($ret == 0) {
-			$ch = curl_init('http://'.$server.'/html/index.html');
-			curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-			$res = curl_exec($ch);
+			/*$ch = $this->init_curl('http://'.$server.'/api/monitoring/status', null, false);
+			$rt = curl_exec($ch);
+            $this->status_xml = $rt;
 			curl_close($ch);
-
-			return (strstr($res, 'hilink')) ? true : false;
+            $res = simplexml_load_string($rt);*/
+			return $this->getMonitor()!==false; //!$this->isError($res) && $res->classify=='hilink';  //(strstr($res, 'response')) ? true : false;
 		}
 
 		return false;
@@ -104,13 +158,37 @@ class HiLink {
 
 	// returns the external ip address
 	public function getExternalIp() {
-		$sc = stream_context_create(array('http' => array('timeout' => 1)));
-		$ip = @file_get_contents($this->ipcheck, false, $sc);
-		return (strlen($ip) > 15) ? '' : $ip;
+	   $sc = stream_context_create(array('http' => array('timeout' => $this->timeout)));
+	   if (is_array($this->ipcheck)){
+	        $i=0;
+	        $ip='';
+            while ($i < count($this->ipcheck) && $ip==''){
+                $ip = filter_var(@file_get_contents($this->ipcheck[$i], false, $sc), FILTER_VALIDATE_IP);
+                $i++;
+            }
+            return $ip;
+        }else{
+    		$ip = filter_var(@file_get_contents($this->ipcheck, false, $sc), FILTER_VALIDATE_IP);
+    		return $ip;
+       }
 	}
 
 	/* --- Traffic Statistics
 	------------------------- */
+	/**
+	 * HiLink::getTrafficStatistic()
+	 * Returns stats about traffic
+	 * @return statistics object or false in case of an error
+    * <CurrentConnectTime>0</CurrentConnectTime>
+    <CurrentUpload>0</CurrentUpload>
+    <CurrentDownload>0</CurrentDownload>
+    <CurrentDownloadRate>0</CurrentDownloadRate>
+    <CurrentUploadRate>0</CurrentUploadRate>
+    <TotalUpload>0</TotalUpload>
+    <TotalDownload>0</TotalDownload>
+    <TotalConnectTime>41</TotalConnectTime>
+    <showtraffic>1</showtraffic>
+	 */
 	public function getTrafficStatistic() {
 		$stats = $this->trafficStats;
 
@@ -118,15 +196,17 @@ class HiLink {
 			return $stats;
 		}
 
-		$ch = curl_init($this->host.'/api/monitoring/traffic-statistics');
-		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+		$ch = $this->init_curl($this->host.'/api/monitoring/traffic-statistics', null, false);
 		$res = curl_exec($ch);
 		curl_close($ch);
 
 		$stats = simplexml_load_string($res);
-		$stats->UpdateTime = time();
-		$this->trafficStats = $stats;
-		return $stats;
+        if (!$this->isError($stats)){
+    		$stats->UpdateTime = time();
+    		$this->trafficStats = $stats;
+    		return $stats;
+        }
+        return false;
 	}
 
 	// Online Time
@@ -208,54 +288,108 @@ class HiLink {
 		echo $this->getTraffic();
 	}
 
+	/**
+	 * HiLink::resetTrafficStats()
+	 * Returns OK if traffic stats were reset
+	 * @return
+	 */
 	public function resetTrafficStats() {
-		$ch = curl_init($this->host.'/api/monitoring/clear-traffic');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
 			CURLOPT_POSTFIELDS => "<request><ClearTraffic>1</ClearTraffic></request>"
-		);
-		curl_setopt_array($ch, $opts);
+		);	   
+		$ch = $this->init_curl($this->host.'/api/monitoring/clear-traffic', $opts);
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
-		return ($res[0] == "OK");
+		return $this->isOK($res);
 	}
 
 	/* --- Provider
 	--------------- */
+	/**
+	 * HiLink::getProvider()
+	 * Returns current provider
+	 * @param string $length full for full name, short for short name, leave '' to return the xml object
+	 * @return string or object(State>0</State>
+                                <FullName>Mobistar</FullName>
+                                <ShortName>Mobistar</ShortName>
+                                <Numeric>20610</Numeric>
+                                <Rat>2</Rat>)
+	 */
 	public function getProvider($length = 'full') {
-		$ch = curl_init($this->host.'/api/net/current-plmn');
-		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+		$ch = $this->init_curl($this->host.'/api/net/current-plmn', null, false);
 		$ret = curl_exec($ch);
 		curl_close($ch);
 		$res = simplexml_load_string($ret);
 
-		switch ($length) {
-			case 'full': return ''.$res->FullName; break;
-			case 'short': return ''.$res->ShortName; break;
-			default: return ''.$res->Numeric; break;
-		}
+        if (!$this->isError($res)){
+    		switch ($length) {
+    			case 'full': return ''.$res->FullName; break;
+    			case 'short': return ''.$res->ShortName; break;
+    			default: return $res;
+    		}
+        }
+        return false;
 	}
 
 	/* --- Monitoring Stats
 	----------------------- */
+
+	/**
+	 * HiLink::getMonitor()
+	 * Returns status monitor object or false on error
+	 * @return object(<ConnectionStatus>902</ConnectionStatus>
+                        <WifiConnectionStatus></WifiConnectionStatus>
+                        <SignalStrength></SignalStrength>
+                        <SignalIcon>4</SignalIcon>
+                        <CurrentNetworkType>41</CurrentNetworkType>
+                        <CurrentServiceDomain>3</CurrentServiceDomain>
+                        <RoamingStatus>1</RoamingStatus>
+                        <BatteryStatus></BatteryStatus>
+                        <BatteryLevel></BatteryLevel>
+                        <BatteryPercent></BatteryPercent>
+                        <simlockStatus>0</simlockStatus>
+                        <WanIPAddress></WanIPAddress>
+                        <WanIPv6Address></WanIPv6Address>
+                        <PrimaryDns></PrimaryDns>
+                        <SecondaryDns></SecondaryDns>
+                        <PrimaryIPv6Dns></PrimaryIPv6Dns>
+                        <SecondaryIPv6Dns></SecondaryIPv6Dns>
+                        <CurrentWifiUser></CurrentWifiUser>
+                        <TotalWifiUser></TotalWifiUser>
+                        <currenttotalwifiuser>0</currenttotalwifiuser>
+                        <ServiceStatus>2</ServiceStatus>
+                        <SimStatus>1</SimStatus>
+                        <WifiStatus></WifiStatus>
+                        <CurrentNetworkTypeEx>41</CurrentNetworkTypeEx>
+                        <maxsignal>5</maxsignal>
+                        <wifiindooronly>-1</wifiindooronly>
+                        <wififrequence>0</wififrequence>
+                        <msisdn></msisdn>
+                        <classify>hilink</classify>
+                        <flymode>0</flymode>)
+	 */
 	public function getMonitor() {
 		$monitor = $this->monitor;
 		if (isset($monitor->UpdateTime) && ($monitor->UpdateTime + 3) > time()) {
 			return $monitor;
 		}
 
-		$ch = curl_init($this->host.'/api/monitoring/status');
-		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+		$ch = $this->init_curl($this->host.'/api/monitoring/status', null, false);
 		$res = curl_exec($ch);
+        $this->status_xml = $res;
 		curl_close($ch);
 
 		$monitor = simplexml_load_string($res);
-		$monitor->UpdateTime = time();
-		$this->monitor = $monitor;
-		return $monitor;
+        if (!$this->isError($monitor)){
+    		$monitor->UpdateTime = time();
+    		$this->monitor = $monitor;
+    		return $monitor;
+        }
+        return false;
 	}
 
 	// IP provider
@@ -275,6 +409,11 @@ class HiLink {
 	}
 
 	// connection status
+	/**
+	 * HiLink::getConnectionStatus()
+	 * Returns current connection status
+	 * @return string
+	 */
 	public function getConnectionStatus() {
 		$mon = $this->getMonitor();
 		switch ($mon->ConnectionStatus) {
@@ -300,6 +439,14 @@ class HiLink {
 			default: return "Unknown type";
 		}
 	}
+
+	/**
+	 * HiLink::setConnectionType()
+	 * Sets connection type
+	 * @param string $type
+	 * @param string $band
+	 * @return bool
+	 */
 	public function setConnectionType($type = 'auto', $band = '-1599903692') {
 		$type = strtolower($type);
 		$req = new \SimpleXMLElement('<request></request>');
@@ -310,18 +457,18 @@ class HiLink {
 		}
 		$req->addChild('NetworkBand', $band);
 
-		$ch = curl_init($this->host.'/api/net/network');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
 			CURLOPT_POSTFIELDS => $req->asXML(),
 		);
-		curl_setopt_array($ch, $opts);
+		$ch = $this->init_curl($this->host.'/api/net/network', $opts);
+
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
-		return ($res[0] == "OK");
+		return $this->isOK($res);
 	}
 
 	// signal strength
@@ -397,14 +544,20 @@ class HiLink {
 
 	/* --- PIN actions
 	------------------ */
+	/**
+	 * HiLink::getPin()
+	 * Returns pin status
+	 * @return object (SimState->int, PinOptState->int,SimPinTimes->int,SimPukTimes->int) or false on error
+	 */
 	public function getPin() {
-		$ch = curl_init($this->host.'/api/pin/status');
-		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+	   
+		$ch = $this->init_curl($this->host.'/api/pin/status', null, false);
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
-		return $res;
+        if (!$this->isError($res)) return $res;
+		return false;
 	}
 
 	private function pinDo($type, $pin, $new = '', $puk = '') {
@@ -414,18 +567,18 @@ class HiLink {
 		$req->addChild('NewPin', $new);
 		$req->addChild('PukCode', $puk);
 
-		$ch = curl_init($this->host.'/api/pin/operate');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
 			CURLOPT_POSTFIELDS => $req->asXML(),
 		);
-		curl_setopt_array($ch, $opts);
+		$ch = $this->init_curl($this->host.'/api/pin/operate',$opts);
+
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
-		return ($res[0] == "OK");
+		return $this->isOK($res);
 	}
 
 	public function pinEnter($pin) {
@@ -479,56 +632,136 @@ class HiLink {
 
 	/* --- Connection
 	----------------- */
+
+    /**
+     * HiLink::connectMDS()
+     * Connects using another method than dialup (mobile-dataswitch API), it will probably depend on which firmware version / type of modem you have if you should use this or the regular connect method
+     * @return bool
+     */
+    public function connectMDS(){
+		$opts = array(
+			CURLOPT_RETURNTRANSFER => 1,
+			CURLOPT_POST => 1,
+			CURLOPT_POSTFIELDS => '<?xml version="1.0" encoding="UTF-8"?><request><dataswitch>1</dataswitch></request>');
+		$ch = $this->init_curl($this->host.'/api/dialup/mobile-dataswitch', $opts);
+
+		$ret = curl_exec($ch);
+		curl_close($ch);
+
+		$res = simplexml_load_string($ret);
+        return $this->isOK($res);
+    }
+
+    /**
+     * HiLink::disconnectMDS()
+     * Disconnects the mobile dataswitch connection
+     * @return bool
+     */
+    public function disconnectMDS(){
+		$opts = array(
+			CURLOPT_RETURNTRANSFER => 1,
+			CURLOPT_POST => 1,
+			CURLOPT_POSTFIELDS => '<?xml version="1.0" encoding="UTF-8"?><request><dataswitch>0</dataswitch></request>');
+		$ch = $this->init_curl($this->host.'/api/dialup/mobile-dataswitch', $opts);
+
+		$ret = curl_exec($ch);
+		curl_close($ch);
+
+		$res = simplexml_load_string($ret);
+        return $this->isOK($res);
+        /*if (!$this->isError($res)){
+            return intval($res->dataswitch)==0;   
+        }*/
+		return false;        
+    }
+
+
+	/**
+	 * HiLink::connect()
+	 * Connects to the 3G network using dialup
+	 * @return bool
+	 */
 	public function connect() {
 		if ($this->isConnected())
 				return true;
 
-		$ch = curl_init($this->host.'/api/dialup/dial');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
-			CURLOPT_POSTFIELDS => "<request><Action>1</Action></request>",
-		);
-		curl_setopt_array($ch, $opts);
+			CURLOPT_POSTFIELDS => "<request><Action>1</Action></request>");
+		$ch = $this->init_curl($this->host.'/api/dialup/dial', $opts);
+
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
 
-		return ($res[0] == 'OK');
+		return $this->isOK($res);
 	}
 
+    /**
+     * HiLink::getconnectedMDS()
+     * Returns if mobile dataswitch is on
+     * @return bool
+     */
+    public function getconnectedMDS(){
+        $ch = $this->init_curl($this->host.'/api/dialup/mobile-dataswitch', null, false);
+        $ret = curl_exec($ch);
+        curl_close($ch);
+        $res =  simplexml_load_string($ret);
+        if (!$this->isError($res)){
+            return intval($res->dataswitch)==1;
+        }
+        return false;
+    }
+
+	/**
+	 * HiLink::disconnect()
+	 * Disconnects from the 3G dialup network
+	 * @return bool
+	 */
 	public function disconnect() {
 		if (!$this->isConnected())
 				return true;
 
-		$ch = curl_init($this->host.'/api/dialup/dial');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
 			CURLOPT_POSTFIELDS => "<request><Action>0</Action></request>",
 		);
-		curl_setopt_array($ch, $opts);
+		$ch = $this->init_curl($this->host.'/api/dialup/dial', $opts);
+
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
 
-		return ($res[0] == 'OK');
+		return $this->isOK($res);
 	}
 
+	/**
+	 * HiLink::isConnected()
+	 * Returns if currently connected to the 3G network
+	 * @return bool
+	 */
 	public function isConnected() {
 		$st = $this->getConnectionStatus();
 		return ($st == 'Connected');
 	}
 
+	/**
+	 * HiLink::getConnection()
+	 * Returns current connection info
+	 * @param bool $asArray
+	 * @return Array or false on error
+	 */
 	public function getConnection($asArray = false) {
-		$ch = curl_init($this->host.'/api/dialup/connection');
-		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+		$ch = $this->init_curl($this->host.'/api/dialup/connection', null, false);
+
 		$ret = curl_exec($ch);
 		curl_close($ch);
 		$res = simplexml_load_string($ret);
-
+        if (isError($res))return false;
 		if ($asArray) {
 			return array(
 				"ConnectMode"          => $res->ConnectMode,
@@ -553,6 +786,17 @@ class HiLink {
 		echo $this->getConnection();
 	}
 
+	/**
+	 * HiLink::doConnection()
+	 * Connects to 3G
+	 * @param mixed $autoconnect
+	 * @param mixed $reconnect
+	 * @param mixed $roamingauto
+	 * @param mixed $roamingre
+	 * @param integer $interval
+	 * @param integer $idle
+	 * @return bool
+	 */
 	private function doConnection($autoconnect, $reconnect, $roamingauto, $roamingre, $interval = 3, $idle = 0) {
 		$req = new \SimpleXMLElement('<request></request>');
 		$req->addChild('RoamAutoConnectEnable', $roamingauto);
@@ -561,20 +805,18 @@ class HiLink {
 		$req->addChild('ReconnectInterval', $interval);
 		$req->addChild('MaxIdelTime', $idle);
 		$req->addChild('ConnectMode', $autoconnect);
-
-		$ch = curl_init($this->host.'/api/dialup/connection');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
-			CURLOPT_POSTFIELDS => $req->asXML(),
-		);
-		curl_setopt_array($ch, $opts);
+			CURLOPT_POSTFIELDS => $req->asXML());
+		$ch = $this->init_curl($this->host.'/api/dialup/connection', $opts);
+
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
 
-		return ($res[0] == "OK");
+		return $this->isOK($res);
 	}
 
 	public function activateAutoconnect() {
@@ -627,15 +869,17 @@ class HiLink {
 			return $device;
 		}
 
-		$ch = curl_init($this->host.'/api/device/information');
-		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+		$ch = $this->init_curl($this->host.'/api/device/information');
 		$res = curl_exec($ch);
 		curl_close($ch);
 
 		$device = simplexml_load_string($res);
-		$device->UpdateTime = time();
-		$this->device = $device;
-		return $device;
+        if (!$this->isError($device)){
+    		$device->UpdateTime = time();
+    		$this->device = $device;
+    		return $device;
+        }
+        return false;
 	}
 
 	public function getDeviceName() {
@@ -735,15 +979,39 @@ class HiLink {
 
 	/* --- APN
 	---------- */
+
+	/**
+	 * HiLink::getApn()
+	 * Returns the APN or false in case of an error
+	 * @return
+	 */
 	public function getApn() {
-		$ch = curl_init($this->host.'/api/dialup/profiles');
-		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+		$ch = $this->init_curl($this->host.'/api/dialup/profiles');
 		$ret = curl_exec($ch);
 		curl_close($ch);
-
-		return simplexml_load_string($ret);
+        $res = simplexml_load_string($ret);
+        if (!$this->isError($res)) return $res;
+        return false;
 	}
 
+	/**
+	 * HiLink::createProfile()
+	 * Creates a dialup profile
+	 * @param mixed $name
+	 * @param mixed $apn
+	 * @param mixed $user
+	 * @param mixed $password
+	 * @param integer $isValid
+	 * @param integer $apnIsStatic
+	 * @param string $dailupNum
+	 * @param integer $authMode
+	 * @param integer $ipIsStatic
+	 * @param string $ipAddress
+	 * @param string $dnsIsStatic
+	 * @param string $primaryDns
+	 * @param string $secondaryDns
+	 * @return bool true on success
+	 */
 	public function createProfile($name, $apn, $user, $password,
 			$isValid = 1, $apnIsStatic = 1, $dailupNum = '*99#', $authMode = 0,
 			$ipIsStatic = 0, $ipAddress = '0.0.0.0', $dnsIsStatic = '', $primaryDns = '', $secondaryDns = '') {
@@ -768,20 +1036,40 @@ class HiLink {
 		$p->addChild('SecondaryDns', $secondaryDns);
 		$p->addChild('ReadOnly', 0);
 
-		$ch = curl_init($this->host.'/api/dialup/profiles');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
 			CURLOPT_POSTFIELDS => $req->asXML(),
 		);
-		curl_setopt_array($ch, $opts);
+		$ch = $this->init_curl($this->host.'/api/dialup/profiles', $opts);
+
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
-		return ($res[0] == "OK");
+		return $this->isOK($res);
 	}
 
+	/**
+	 * HiLink::editProfile()
+	 * Edits a dialup profile
+	 * @param mixed $idx
+	 * @param mixed $name
+	 * @param mixed $apn
+	 * @param mixed $user
+	 * @param mixed $password
+	 * @param integer $readOnly
+	 * @param integer $isValid
+	 * @param integer $apnIsStatic
+	 * @param string $dailupNum
+	 * @param integer $authMode
+	 * @param integer $ipIsStatic
+	 * @param string $ipAddress
+	 * @param string $dnsIsStatic
+	 * @param string $primaryDns
+	 * @param string $secondaryDns
+	 * @return bool
+	 */
 	public function editProfile($idx, $name, $apn, $user, $password,
 			$readOnly = 0, $isValid = 1, $apnIsStatic = 1, $dailupNum = '*99#', $authMode = 0,
 			$ipIsStatic = 0, $ipAddress = '0.0.0.0', $dnsIsStatic = '', $primaryDns = '', $secondaryDns = '') {
@@ -806,58 +1094,69 @@ class HiLink {
 		$p->addChild('SecondaryDns', $secondaryDns);
 		$p->addChild('ReadOnly', $readOnly);
 
-		$ch = curl_init($this->host.'/api/dialup/profiles');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
 			CURLOPT_POSTFIELDS => $req->asXML(),
 		);
-		curl_setopt_array($ch, $opts);
+		$ch = $this->init_curl($this->host.'/api/dialup/profiles', $opts);
+
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
-		return ($res[0] == "OK");
+		return $this->isOK($res);
 	}
 
+	/**
+	 * HiLink::setProfileDefault()
+	 * Sets default profile index
+	 * @param int $idx
+	 * @return bool
+	 */
 	public function setProfileDefault($idx) {
 		$req = new \SimpleXMLElement('<request></request>');
 		$req->addChild('Delete', 0);
 		$req->addChild('SetDefault', $idx);
 		$req->addChild('Modify', 0);
 
-		$ch = curl_init($this->host.'/api/dialup/profiles');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
 			CURLOPT_POSTFIELDS => $req->asXML(),
 		);
-		curl_setopt_array($ch, $opts);
+		$ch = $this->init_curl($this->host.'/api/dialup/profiles', $opts);
+
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
-		return ($res[0] == "OK");
+		return $this->isOK($res);
 	}
 
+	/**
+	 * HiLink::deleteProfile()
+	 * Deletes a profile
+	 * @param int $idx
+	 * @return bool
+	 */
 	public function deleteProfile($idx) {
 		$req = new \SimpleXMLElement('<request></request>');
 		$req->addChild('Delete', $idx);
 		$req->addChild('SetDefault', 1);
 		$req->addChild('Modify', 0);
 
-		$ch = curl_init($this->host.'/api/dialup/profiles');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
-			CURLOPT_POSTFIELDS => $req->asXML(),
-		);
-		curl_setopt_array($ch, $opts);
+			CURLOPT_POSTFIELDS => $req->asXML());
+		$ch = $this->init_curl($this->host.'/api/dialup/profiles', $opts);
+
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
-		return ($res[0] == "OK");
+		return $this->isOK($res);
 	}
 
 	public function listApn($asArray = false) {
@@ -893,6 +1192,15 @@ class HiLink {
 
 	/* --- SMS
 	---------- */
+	/**
+	 * HiLink::getSms()
+	 * 
+	 * @param integer $box one of the SMS_BOX constants
+	 * @param integer $site
+	 * @param integer $prefUnread
+	 * @param integer $count
+	 * @return SimpleXMLElement object
+	 */
 	public function getSms($box = 1, $site = 1, $prefUnread = 0, $count = 20) {
 		$req = new \SimpleXMLElement('<request></request>');
 		$req->addChild('PageIndex', $site);
@@ -902,21 +1210,33 @@ class HiLink {
 		$req->addChild('Ascending', 0);
 		$req->addChild('UnreadPreferred', $prefUnread);
 
-		$ch = curl_init($this->host.'/api/sms/sms-list');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
-			CURLOPT_POSTFIELDS => $req->asXML(),
-		);
-		curl_setopt_array($ch, $opts);
+			CURLOPT_POSTFIELDS => $req->asXML());
+
+		$ch = $this->init_curl($this->host.'/api/sms/sms-list', $opts);
+
 		$ret = curl_exec($ch);
 		curl_close($ch);
-
-		return simplexml_load_string($ret);
+        $res = simplexml_load_string($ret);
+        if (!$this->isError($res)){
+            return $res;
+        }else{
+            return false;
+        }
 	}
 
+	/**
+	 * HiLink::doSmsBox()
+	 * Loads sms messages from a certain box as an array
+	 * @param mixed $box
+	 * @param mixed $asArray
+	 * @return Array or bool false on error
+	 */
 	private function doSmsBox($box, $asArray) {
 		$box = $this->getSms($box);
+        if ($box===false) return false;
 		$ret = array();
 
 		$msg = $box->Messages->Message;
@@ -976,43 +1296,76 @@ class HiLink {
 		}
 	}
 
+	/**
+	 * HiLink::getNotifications()
+	 * Returns notification messages
+	 * @return object (UnreadMessage->int,SmsStorageFull->bool,OnlineUpdateStatus->int) or bool false on error
+	 */
 	public function getNotifications() {
-		$ch = curl_init($this->host.'/api/monitoring/check-notifications');
-		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+		$ch = $this->init_curl($this->host.'/api/monitoring/check-notifications', null, false);
 		$ret = curl_exec($ch);
 		curl_close($ch);
-
-		return simplexml_load_string($ret);
+        $res = simplexml_load_string($ret);
+		if (!$this->isError($res)) return $res;
+        return false;
 	}
 
+	/**
+	 * HiLink::getUnreadSms()
+	 * Returns number of new unread sms messages
+	 * @return int or false on error
+	 */
 	public function getUnreadSms() {
 		$not = $this->getNotifications();
 		return $not->UnreadMessage;
 	}
 
+	/**
+	 * HiLink::smsStorageFull()
+	 * Returns if sms storage is full
+	 * @return bool
+	 */
 	public function smsStorageFull() {
 		$not = $this->getNotificaitons();
 		return ($not->SmsStorageFull == 0) ? false : true;
 	}
 
+	/**
+	 * HiLink::getSmsCount()
+	 * Returns number of messages in $box
+	 * @param string $box of: SMS_BOX_IN, SMS_BOX_OUT, SMS_BOX_DRAFT, SMS_BOX_DELETED, SMS_BOX_UNREAD
+	 * @return int or false on error
+	 */
 	public function getSmsCount($box = 'default') {
-		$ch = curl_init($this->host.'/api/sms/sms-count');
-		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+		$ch = $this->init_curl($this->host.'/api/sms/sms-count', null, false);
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
-
+        if (isError($res)) return false;
 		switch ($box) {
-			case 'in': case 'inbox': case 1:
+			case 'in': 
+            case 'inbox': 
+            case 1:
+            case SMS_BOX_IN:
 				return "".$res->LocalInbox;
-			case 'out': case 'outbox': case 2:
+			case 'out': 
+            case 'outbox': 
+            case 2:
+            case SMS_BOX_OUT:
 				return "".$res->LocalOutbox;
-			case 'draft': case 'drafts': case 3:
+			case 'draft': 
+            case 'drafts': 
+            case 3:
+            case SMS_BOX_DRAFT:
 				return "".$res->LocalDraft;
-			case 'deleted': case 4:
+			case 'deleted': 
+            case 4:
+            case SMS_BOX_DELETED:
 				return "".$res->localDeleted;
-			case 'unread': case 'new':
+			case 'unread': 
+            case 'new':
+            case SMS_BOX_UNREAD:
 				return "".$res->LocalUnread;
 			default:
 				return array(
@@ -1025,8 +1378,14 @@ class HiLink {
 		}
 	}
 
+	/**
+	 * HiLink::listUnreadSms()
+	 * Lists all unread messages
+	 * @return array of sms or false on error
+	 */
 	public function listUnreadSms() {
 		$list = $this->getSmsInbox();
+        if ($list===false) return false;
 		$ret = array();
 		foreach ($list as $sms) {
 			if (!$sms['read']) {
@@ -1037,6 +1396,12 @@ class HiLink {
 		return $ret;
 	}
 
+	/**
+	 * HiLink::setSmsRead()
+	 * Changes the status of the SMS at $idx to read
+	 * @param int $idx
+	 * @return bool
+	 */
 	public function setSmsRead($idx) {
 		$req = new \SimpleXMLElement('<request></request>');
 
@@ -1047,21 +1412,25 @@ class HiLink {
 			$req->addChild('Index', $idx);
 		}
 
-		$ch = curl_init($this->host.'/api/sms/set-read');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
-			CURLOPT_POSTFIELDS => $req->asXML(),
-		);
-		curl_setopt_array($ch, $opts);
+			CURLOPT_POSTFIELDS => $req->asXML());
+		$ch = $this->init_curl($this->host.'/api/sms/set-read',$opts);
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
 
-		return ($res[0] == "OK");
+		return $this->isOK($res);
 	}
 
+	/**
+	 * HiLink::deleteSms()
+	 * Delete SMS at memory index $idx
+	 * @param int $idx
+	 * @return bool
+	 */
 	public function deleteSms($idx) {
 		$req = new \SimpleXMLElement('<request></request>');
 
@@ -1072,21 +1441,28 @@ class HiLink {
 			$req->addChild('Index', $idx);
 		}
 
-		$ch = curl_init($this->host.'/api/sms/delete-sms');
 		$opts = array(
 			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
-			CURLOPT_POSTFIELDS => $req->asXML(),
-		);
-		curl_setopt_array($ch, $opts);
+			CURLOPT_POSTFIELDS => $req->asXML());
+		$ch = $this->init_curl($this->host.'/api/sms/delete-sms', $opts);
+
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
 
-		return ($res[0] == "OK");
+		return $this->isOK($res);
 	}
 
+	/**
+	 * HiLink::sendSms()
+	 * Sends an SMS to $no with $message
+	 * @param mixed $no
+	 * @param string $message
+	 * @param integer $idx
+	 * @return bool true in case of no errors, use sendSMSStatus to check for sending status
+	 */
 	public function sendSms($no, $message, $idx = -1) {
 		$req = new \SimpleXMLElement('<request></request>');
 		$req->addChild('Index', $idx);
@@ -1106,37 +1482,126 @@ class HiLink {
 		$req->addChild('Reserved', 1);
 		$req->addChild('Date', date('Y-m-d H:i:s'));
 
-//		return true;  // backup return to prohibit high costs
-
-		$ch = curl_init($this->host.'/api/sms/send-sms');
 		$opts = array(
-			CURLOPT_RETURNTRANSFER => 1,
 			CURLOPT_POST => 1,
-			CURLOPT_POSTFIELDS => $req->asXML(),
-		);
-		curl_setopt_array($ch, $opts);
+			CURLOPT_POSTFIELDS => $req->asXML());
+		$ch = $this->init_curl($this->host.'/api/sms/send-sms', $opts);
+
+		//curl_setopt_array($ch, $opts);
 		$ret = curl_exec($ch);
 		curl_close($ch);
-
 		$res = simplexml_load_string($ret);
-
-		return ($res[0] == "OK");
+        return $this->isOK($res);
 	}
 
+	/**
+	 * HiLink::sendSmsStatus()
+	 * object {TotalCount,
+               CurIndex,
+               Phone,
+               SucPhone => Array(),
+               FailPhone => Array()
+              }
+	 * @return SimpleXMLElement or false in case of an error returns false
+	 */
 	public function sendSmsStatus() {
-		$ch = curl_init($this->host.'/api/sms/send-status');
-		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+		$ch = $this->init_curl($this->host.'/api/sms/send-status', null, false);
 		$ret = curl_exec($ch);
 		curl_close($ch);
 
 		$res = simplexml_load_string($ret);
-
-		return $res;
+        if (!$this->isError($res)) return $res;
+		return false;
 	}
 
+    /**
+     * HiLink::getToken()
+     * Gets a new token for posting or returns empty string on error
+     * @return string
+     */
+    public function getToken(){
+        $ch = curl_init($this->host.'/api/webserver/token');
+		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt($ch, CURLOPT_ENCODING , "gzip");
+		$ret = curl_exec($ch);
+		curl_close($ch);
+        $res = simplexml_load_string($ret);
+		if (!$this->isError($res)) return $res->token;
+        return '';
+    }
+
+    /**
+     * HiLink::getErrorCode()
+     * Returns the last error code
+     * @return int
+     */
+    public function getErrorCode(){
+        return $this->lastError->code;
+    }
+
+    /**
+     * HiLink::getErrorMessage()
+     * Returns the last error message
+     * @return string
+     */
+    public function getErrorMessage(){
+        return $this->lastError->message;
+    }
 
 	/* --- HELPER FUNCTIONS
 	----------------------- */
+
+    /**
+     * HiLink::isOK()
+     * Returns true if the $res is OK, if is error the lastError will be set
+     * @param SimpleXMLElement $res
+     * @return bool
+     */
+    private function isOK($res){
+        return !$this->isError($res) && strtoupper($res->__toString())=='OK';
+    }
+    
+    /**
+     * HiLink::isError()
+     * Returns is the $res is an error object and set the lastError
+     * @param SimpleXMLElement $res
+     * @return bool
+     */
+    private function isError($res){
+        if(is_object($res) && $res->getName()=='error'){
+            $this->lastError = $res;
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * HiLink::init_curl()
+     * Common curl init function
+     * @param string $url full url to download
+     * @param array $options optional curl options
+     * @param bool $add_token_header if true, a token will be obtained from the device first and added as __RequestVerificationToken header to the http request
+     * @return resource
+     */
+    private function init_curl($url, $options=null, $add_token_header=true){
+        $ch = curl_init($url);
+        if (is_array($options)) curl_setopt_array($ch, $options);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt($ch, CURLOPT_ENCODING , "gzip");
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, $this->timeout);
+        curl_setopt($ch, CURLOPT_TIMEOUT, $this->timeout);
+        if ($add_token_header && $this->useToken){
+            $token = $this->getToken();
+            curl_setopt($ch,CURLOPT_HTTPHEADER,array('__RequestVerificationToken: '.$token));
+        }
+        return $ch;
+    }
+
+	/**
+	 * HiLink::getSystem()
+	 * Returns which system we are running
+	 * @return string (mac, lnx, win)
+	 */
 	private function getSystem() {
 		if (substr(__DIR__,0,1) == '/') {
 			return (exec('uname') == 'Darwin') ? 'mac' : 'lnx';
