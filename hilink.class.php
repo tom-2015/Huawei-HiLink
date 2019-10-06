@@ -68,7 +68,7 @@ class HiLink {
 	 * @param integer $timeout optional a timeout for communicating with the stick
 	 * @return void
 	 */
-	public function __construct($host='192.168.8.1', $external_ip_check= null, $timeout=10) {
+	public function __construct($host='192.168.8.1', $external_ip_check= null, $timeout=60) {
 	    if ($external_ip_check==null){
 	       $external_ip_check=array("http://icanhazip.com/","http://checkip.amazonaws.com/","https://wtfismyip.com/text", "http://ipecho.net/plain","http://v4.ident.me/", "http://smart-ip.net/myip");
         }
@@ -1536,7 +1536,7 @@ class HiLink {
      * @return int
      */
     public function getErrorCode(){
-        return $this->lastError->code;
+        return @$this->lastError->code;
     }
 
     /**
@@ -1545,7 +1545,11 @@ class HiLink {
      * @return string
      */
     public function getErrorMessage(){
-        return $this->lastError->message;
+        return @$this->lastError->message;
+    }
+    
+    public function getErrorObject(){
+        return $this->lastError;
     }
 
 	/* --- HELPER FUNCTIONS
