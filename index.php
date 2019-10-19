@@ -5,7 +5,23 @@ date_default_timezone_set('UTC');
 
 require_once __DIR__.'/hilink.class.php';
 
-$hilink = AMWD\HiLink::create();
+
+//API_VERSION_E303 FOR 
+
+//
+$hilink = new AMWD\HiLink('192.168.8.1', null, 60, API_VERSION_E8372); 
+
+
+//only if login required:
+if ( $hilink->login("admin", "admin")){
+    echo "Login OK";
+}
+
+/*echo "sms: ".var_export($hilink->getSmsInbox(), true);
+
+var_export($hilink->getErrorObject(), true);
+
+die ("ok");*/
 
 echo "Host: ".$hilink->getHost().PHP_EOL;
 echo "Online: ".$hilink->online().PHP_EOL;
@@ -33,13 +49,18 @@ $hilink->printPinStatus();
 
 echo PHP_EOL;
 
-//echo "Connect: ".$hilink->connect().PHP_EOL;
-//sleep(5);
-//$hilink->printStatus();
-//sleep(10);
-//echo "Disconnect: ".$hilink->disconnect().PHP_EOL;
-//sleep(5);
-//echo "isConnected: ".$hilink->isConnected().PHP_EOL;
+echo "Connect: ".$hilink->connect().PHP_EOL;
+sleep(5);
+$hilink->printStatus();
+
+while (!$hilink->isConnected()){
+    sleep(5);
+    echo "Waiting for connection...".PHP_EOL;
+}
+
+echo "Disconnect: ".$hilink->disconnect().PHP_EOL;
+sleep(5);
+echo "isConnected: ".$hilink->isConnected().PHP_EOL;
 
 //echo "Switch to 2G: ".$hilink->setConnectionType('2g').PHP_EOL;
 //sleep(10);
@@ -75,7 +96,23 @@ echo PHP_EOL;
 
 //print_r($hilink->sendSmsStatus());
 
-$hilink->printSmsBox();
+$hilink->printSmsBox(); 
+
+while ($hilink->online()){
+        echo "Modem online ".date("d-m-Y H:i:s")." OK.<br/>\n";
+        
+        $inbox_list = $hilink->getSmsInbox(true);
+        if ($inbox_list===false) {
+            debug_print("Getting inbox list failed: ".var_export($hilink->getErrorObject(), true), __FILE__, __LINE__);
+            throw new Exception("Getting Inbox");
+        }
+        
+        foreach ($inbox_list as $sms){
+            echo "Receiving 1 SMS from ".$sms['number']." Message: ".$sms['msg']."<br/>\n";
+            $hilink->deleteSms($sms['idx']);
+        }
+        sleep (10);
+}
 
 //$hilink->deleteProfile(2);
 //$hilink->deleteProfile(3);

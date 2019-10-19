@@ -14,11 +14,22 @@
  * Link: http://www.huaweidevices.de/e303
  **/
 /*
-This class was last tested and modifie to with with E303 USB modem with:
-hardware: CH1E3531SM
+This class was last tested and modified for:
+
+E303
+hardware: CH1E3531SMd
 software: 22.318.25.00.414
 web ui: 15.100.10.00.414
+
+E8372
+hardware: CL1E8372HM
+software: 21.316.01.04.274
+web ui: 17.100.45.10.274
 */
+
+//Thanks to:
+//https://github.com/if0xx/Huawei-Hilink-API
+
 namespace AMWD;
 
 @error_reporting(0);
@@ -41,6 +52,7 @@ define("ERROR_LOGIN_USERNAME_PWD_WRONG",108006);
 define("ERROR_LOGIN_USERNAME_PWD_ORERRUN",108007);
 define("ERROR_VOICE_BUSY",120001);
 define("ERROR_WRONG_TOKEN",125001);
+define("ERROR_LOGIN", 125002); //if not correctly logged in...
 define("SMS_SYSTEMBUSY", 113018);
 
 define ("SMS_BOX_IN", 1);
@@ -54,10 +66,21 @@ define ("CONNECTION_STATUS_CONNECTED", 901);
 define ("CONNECTION_STATUS_DISCONNECTED", 902);
 define ("CONNECTION_STATUS_DISCONNECTING", 903);
 
+define ("API_VERSION_E303", 1);
+define ("API_VERSION_E8372", 2);
+
 class HiLink {
 	// Class Attributes
-	private $host, $ipcheck, $useToken;
-
+	protected $host;  //the hilink IP
+    protected $ipcheck; //required only for getExternalIp(), an URL that only returns your external IP as result
+    protected $useToken; //if true __RequestVerificationToken will be added to the request for older api versions this may not be needed
+    protected $common_headers; //common headers that will be added to each request
+    protected $sessionID; //array of cookies and values
+    protected $requestTokenOne; //tokens are needed for modems that require authentication like the E8372
+    protected $requestTokenTwo;
+	protected $requestToken;
+    protected $api_version;
+    
 	public $trafficStats, $monitor, $device, $lastError, $status_xml;
 
 	/**
@@ -68,14 +91,20 @@ class HiLink {
 	 * @param integer $timeout optional a timeout for communicating with the stick
 	 * @return void
 	 */
-	public function __construct($host='192.168.8.1', $external_ip_check= null, $timeout=60) {
+	public function __construct($host='192.168.8.1', $external_ip_check= null, $timeout=60, $version=API_VERSION_E303) {
+	   $this->common_headers=array();
 	    if ($external_ip_check==null){
 	       $external_ip_check=array("http://icanhazip.com/","http://checkip.amazonaws.com/","https://wtfismyip.com/text", "http://ipecho.net/plain","http://v4.ident.me/", "http://smart-ip.net/myip");
+        }
+        if ($version==API_VERSION_E8372){
+            $this->common_headers[]="X-Requested-With: XMLHttpRequest";
         }
 	    $this->setHost($host);
 		$this->setIpCheck($external_ip_check);
         $this->useToken=true;
         $this->timeout=$timeout;
+        $this->api_version = $version;
+        $this->tokens=array();
 	}
 
 	// call default constructor
@@ -284,6 +313,7 @@ class HiLink {
 			return $ret;
 		}
 	}
+    
 	public function printTraffic() {
 		echo $this->getTraffic();
 	}
@@ -761,7 +791,7 @@ class HiLink {
 		$ret = curl_exec($ch);
 		curl_close($ch);
 		$res = simplexml_load_string($ret);
-        if (isError($res))return false;
+        if ($this->isError($res))return false;
 		if ($asArray) {
 			return array(
 				"ConnectMode"          => $res->ConnectMode,
@@ -1529,6 +1559,31 @@ class HiLink {
 		if (!$this->isError($res)) return $res->token;
         return '';
     }
+    
+    /**
+     * HiLink::getSessionToken()
+     * Session token for login, version E8372 only
+     * @return
+     */
+    public function getSessionToken(){
+        $ch = curl_init($this->host.'/api/webserver/SesTokInfo');
+		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt($ch, CURLOPT_ENCODING , "gzip");
+		$ret = curl_exec($ch);
+		curl_close($ch);
+        $res = simplexml_load_string($ret);
+		if (!$this->isError($res)){
+		  if (isset($res->SesInfo)){
+		      $parts = explode("=",$res->SesInfo);
+		      $this->sessionID=isset($parts[1]) ? $parts[1]: $parts[0];
+		  }
+          $this->requestToken=$res->TokInfo;
+          return $res->TokInfo;
+		} 
+        return '';        
+    }
+    
+    
 
     /**
      * HiLink::getErrorCode()
@@ -1550,6 +1605,27 @@ class HiLink {
     
     public function getErrorObject(){
         return $this->lastError;
+    }
+    
+    public function login ($user, $pwd){
+        if ($this->requestToken=='' || $this->sessionID=='') $this->getSessionToken();
+        $password = base64_encode(hash('sha256', $user.base64_encode(hash('sha256', $pwd, false)).$this->requestToken, false));
+        
+        $req = new \SimpleXMLElement('<request></request>');
+		$req->addChild('Username', $user);
+        $req->addChild('Password', $password);
+        $req->addChild('password_type',4);
+  
+		$opts = array(
+			CURLOPT_POST => 1,
+			CURLOPT_POSTFIELDS => $req->asXML());
+		$ch = $this->init_curl($this->host.'/api/user/login', $opts);
+
+   		$ret = curl_exec($ch);
+		curl_close($ch);
+		$res = simplexml_load_string($ret);
+        return $this->isOK($res);
+        
     }
 
 	/* --- HELPER FUNCTIONS
@@ -1584,21 +1660,75 @@ class HiLink {
      * Common curl init function
      * @param string $url full url to download
      * @param array $options optional curl options
-     * @param bool $add_token_header if true, a token will be obtained from the device first and added as __RequestVerificationToken header to the http request
      * @return resource
      */
-    private function init_curl($url, $options=null, $add_token_header=true){
+    private function init_curl($url, $options=null){
         $ch = curl_init($url);
         if (is_array($options)) curl_setopt_array($ch, $options);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
         curl_setopt($ch, CURLOPT_ENCODING , "gzip");
         curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, $this->timeout);
         curl_setopt($ch, CURLOPT_TIMEOUT, $this->timeout);
-        if ($add_token_header && $this->useToken){
-            $token = $this->getToken();
-            curl_setopt($ch,CURLOPT_HTTPHEADER,array('__RequestVerificationToken: '.$token));
+        curl_setopt($ch, CURLOPT_HEADERFUNCTION, array ($this, 'curlHeaderCallback'));
+        if ($this->useToken){
+            $cookies = array();
+            if ($this->api_version==API_VERSION_E303){
+                $token = $this->getToken();
+            }else{
+                if ($this->sessionID=='' || $this->requestToken==''){
+                   $this->getSessionToken(); 
+                } 
+                $token=$this->requestToken;
+                $cookies[] = 'Cookie: SessionID='.$this->sessionID;
+            }
+            
+            //print_r($this->api_version);
+            //if ($this->sessionID!='') 
+            //print_r(array_merge($cookies, $this->common_headers, array('__RequestVerificationToken: '.$token)));
+            //echo PHP_EOL;
+            //print_r($cookies);
+            //echo PHP_EOL;
+            //print_r($this->common_headers);
+            //echo PHP_EOL;
+            //print_r($token);
+            //echo PHP_EOL;
+            curl_setopt($ch,CURLOPT_HTTPHEADER, array_merge($cookies, $this->common_headers, array('__RequestVerificationToken: '.$token)));
         }
         return $ch;
+    }
+    
+    protected function curlHeaderCallback($resURL, $header_line) {
+  		/*
+		* Not the prettiest way to parse it out, but hey it works.
+		* If adding more or changing, remember the trim() call 
+		* as the strings have nasty null bytes.
+		*/
+	    if(strpos($header_line, '__RequestVerificationTokenOne') === 0)
+	    {
+	    	$token = trim(substr($header_line, strlen('__RequestVerificationTokenOne:')));
+	    	$this->requestTokenOne = $token;
+	    }
+	    elseif(strpos($header_line, '__RequestVerificationTokenTwo') === 0)
+	    {
+	    	$token = trim(substr($header_line, strlen('__RequestVerificationTokenTwo:')));
+	    	$this->requestTokenTwo = $token;
+	    }
+	    elseif(strpos($header_line, '__RequestVerificationToken') === 0)
+	    {
+	    	$token = trim(substr($header_line, strlen('__RequestVerificationToken:')));
+	    	$this->requestToken = $token;
+	    }
+	    elseif(strpos($header_line, 'Set-Cookie:') === 0)
+	    {
+	    	$cookie = trim(substr($header_line, strlen('Set-Cookie:')));
+            $cookies= $this->parse_cookies($cookie);
+            foreach ($cookies as $cookie){
+                if ($cookie->name=="SessionID"){
+                    $this->sessionID=$cookie->value;
+                }
+            }
+	    }
+	    return strlen($header_line);
     }
 
 	/**
@@ -1635,6 +1765,69 @@ class HiLink {
 		if ($bytes > (1024*1024)) return $mb." MB";
 		if ($bytes > 1024) return $kb." KB";
 		else return $bytes." B";
+	}
+    
+    protected function parse_cookies($header) {
+    	$cookies = array();
+    	
+    	$cookie = new HiLinkcookie();
+    	
+    	$parts = explode("=",$header);
+    	for ($i=0; $i< count($parts); $i++) {
+    		$part = $parts[$i];
+    		if ($i==0) {
+    			$key = $part;
+    			continue;
+    		} elseif ($i== count($parts)-1) {
+    			$cookie->set_value($key,$part);
+    			$cookies[] = $cookie;
+    			continue;
+    		}
+    		$comps = explode(" ",$part);
+    		$new_key = $comps[count($comps)-1];
+    		$value = substr($part,0,strlen($part)-strlen($new_key)-1);
+    		$terminator = substr($value,-1);
+    		$value = substr($value,0,strlen($value)-1);
+    		$cookie->set_value($key,$value);
+    		if ($terminator == ",") {
+    			$cookies[] = $cookie;
+    			$cookie = new HiLinkcookie();
+    		}
+    		
+    		$key = $new_key;
+    	}
+    	return $cookies;
+    }
+}
+
+//https://gist.github.com/pokeb/10590
+class HiLinkcookie {
+	public $name = "";
+	public $value = "";
+	public $expires = "";
+	public $domain = "";
+	public $path = "";
+	public $secure = false;
+	
+	public function set_value($key,$value) {
+		switch (strtolower($key)) {
+			case "expires":
+				$this->expires = $value;
+				return;
+			case "domain":
+				$this->domain = $value;
+				return;
+			case "path":
+				$this->path = $value;
+				return;
+			case "secure":
+				$this->secure = ($value == true);
+				return;
+		}
+		if ($this->name == "" && $this->value == "") {
+			$this->name = $key;
+			$this->value = $value;
+		}
 	}
 }
 
